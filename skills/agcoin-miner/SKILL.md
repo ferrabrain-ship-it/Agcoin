@@ -59,13 +59,13 @@ Do NOT proceed until you have successfully resolved the wallet address.
 
 ### 2. Check Balance and Fund Wallet
 
-The miner needs at least **25,000,000 AGCOIN** to mine. Credits per solve are tiered by balance at submit time:
+The miner needs at least **100 AGCOIN** to mine. Credits per solve are tiered by balance at submit time:
 
 | Balance | Credits per solve |
 |---------|-------------------|
-| >= 25,000,000 AGCOIN | 1 credit |
-| >= 50,000,000 AGCOIN | 2 credits |
-| >= 100,000,000 AGCOIN | 3 credits |
+| >= 100 AGCOIN | 1 credit |
+| >= 200 AGCOIN | 2 credits |
+| >= 300 AGCOIN | 3 credits |
 
 **Check balances** using Bankr natural language (async — returns jobId, poll until complete):
 
@@ -78,7 +78,7 @@ curl -s -X POST https://api.bankr.bot/agent/prompt \
 
 Response: `{ "success": true, "jobId": "...", "status": "pending" }`. Poll `GET https://api.bankr.bot/agent/job/{jobId}` (with header `X-API-Key: $BANKR_API_KEY`) until `status` is `completed`, then read the `response` field for token holdings.
 
-**If AGCOIN balance is below 25,000,000**, help the user buy tokens:
+**If AGCOIN balance is below 100**, help the user buy tokens:
 
 Bankr uses Uniswap pools (not Clanker). Use the **swap** format with the real AGCOIN token address. Swap enough to reach at least 25M AGCOIN (e.g. `swap $10 of ETH to ...` depending on price):
 
