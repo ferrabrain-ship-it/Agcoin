@@ -787,8 +787,34 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: "internal_error" });
 });
 
-app.listen(config.port, () => {
+const server = app.listen(config.port, () => {
   console.log(`agcoin-coordinator listening on :${config.port}`);
   console.log(`mining contract: ${getAddress(config.miningContractAddress)} | chainId: ${config.chainId}`);
   console.log(`coordinator signer: ${coordinatorSigner.address}`);
 });
+
+let shuttingDown = false;
+
+function gracefulShutdown(signal: NodeJS.Signals) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`received ${signal}, shutting down gracefully...`);
+
+  server.close((error) => {
+    if (error) {
+      console.error("error during server close:", error);
+      process.exit(1);
+      return;
+    }
+    process.exit(0);
+  });
+
+  // Safety timeout to avoid hanging indefinitely.
+  setTimeout(() => {
+    console.error("forced shutdown after timeout");
+    process.exit(1);
+  }, 10000).unref();
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
