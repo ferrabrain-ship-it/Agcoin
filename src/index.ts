@@ -369,9 +369,24 @@ app.post("/v1/auth/verify", async (req, res, next) => {
       return;
     }
 
-    const recovered = getAddress(verifyMessage(parsed.message, parsed.signature));
+    let recovered: string;
+    try {
+      recovered = getAddress(verifyMessage(parsed.message, parsed.signature));
+    } catch (error) {
+      res.status(401).json({
+        error: "invalid_signature",
+        reason: "signature_parse_failed",
+        details: (error as Error).message
+      });
+      return;
+    }
     if (recovered !== miner) {
-      res.status(401).json({ error: "invalid_signature" });
+      res.status(401).json({
+        error: "invalid_signature",
+        reason: "recovered_mismatch",
+        expectedMiner: miner,
+        recoveredSigner: recovered
+      });
       return;
     }
 
