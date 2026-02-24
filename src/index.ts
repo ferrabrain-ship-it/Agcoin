@@ -7,8 +7,11 @@ import {
   JsonRpcProvider,
   Wallet,
   getAddress,
+  getBytes,
+  hashMessage,
   keccak256,
   randomBytes,
+  recoverAddress,
   solidityPacked,
   toUtf8Bytes,
   verifyMessage
@@ -26,7 +29,7 @@ const config = {
   epochDurationSeconds: Number(process.env.EPOCH_DURATION_SECONDS ?? 86400),
   authNonceTtlSeconds: Number(process.env.AUTH_NONCE_TTL_SECONDS ?? 300),
   authTokenTtlSeconds: Number(process.env.AUTH_TOKEN_TTL_SECONDS ?? 900),
-  eip712Name: process.env.EIP712_NAME ?? "BotcoinMining",
+  eip712Name: process.env.EIP712_NAME ?? "AgcoinMining",
   eip712Version: process.env.EIP712_VERSION ?? "1",
   rulesVersion: Number(process.env.RULES_VERSION ?? 1),
   agcoinTokenAddress: process.env.AGCOIN_TOKEN_ADDRESS,
@@ -48,7 +51,7 @@ const miningAbi = [
   "function tier3Balance() view returns (uint256)",
   "function currentEpoch() view returns (uint64)",
   "function genesisTimestamp() view returns (uint256)",
-  "function botcoinToken() view returns (address)",
+  "function agcoinToken() view returns (address)",
   "function claim(uint64[] epochIds)",
   "function submitReceipt(uint64,uint64,bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,uint128,uint32,bytes)"
 ];
@@ -108,6 +111,146 @@ function parseNonceFromMessage(message: string): string | null {
   return match?.[1] ?? null;
 }
 
+function normalizeSignatureHex(signature: string): string {
+  let value = signature.trim();
+  if (
+    (value.startsWith("\"") && value.endsWith("\"")) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    value = value.slice(1, -1).trim();
+  }
+  if (!value.startsWith("0x")) value = `0x${value}`;
+  return value;
+}
+
+function bytesToHexNoPrefix(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString("hex");
+}
+
+function padTo32BytesHex(hexNoPrefix: string): string | null {
+  const normalized = hexNoPrefix.replace(/^0+/, "") || "0";
+  if (normalized.length > 64) return null;
+  return normalized.padStart(64, "0");
+}
+
+function readDerLen(bytes: Uint8Array, offset: number): { length: number; next: number } | null {
+  if (offset >= bytes.length) return null;
+  const first = bytes[offset];
+  if ((first & 0x80) === 0) {
+    return { length: first, next: offset + 1 };
+  }
+
+  const octets = first & 0x7f;
+  if (octets === 0 || octets > 2) return null;
+  if (offset + 1 + octets > bytes.length) return null;
+
+  let length = 0;
+  for (let i = 0; i < octets; i += 1) {
+    length = (length << 8) | bytes[offset + 1 + i];
+  }
+  return { length, next: offset + 1 + octets };
+}
+
+function parseDerEcdsa(signatureBytes: Uint8Array): { r: string; s: string } | null {
+  // ASN.1 DER: 30 <len> 02 <r-len> <r> 02 <s-len> <s>
+  if (signatureBytes.length < 8 || signatureBytes[0] !== 0x30) return null;
+
+  const seq = readDerLen(signatureBytes, 1);
+  if (!seq) return null;
+  let cursor = seq.next;
+  if (cursor + seq.length !== signatureBytes.length) return null;
+
+  if (cursor >= signatureBytes.length || signatureBytes[cursor] !== 0x02) return null;
+  const rLenInfo = readDerLen(signatureBytes, cursor + 1);
+  if (!rLenInfo) return null;
+  cursor = rLenInfo.next;
+  if (cursor + rLenInfo.length > signatureBytes.length) return null;
+  const rRaw = signatureBytes.slice(cursor, cursor + rLenInfo.length);
+  cursor += rLenInfo.length;
+
+  if (cursor >= signatureBytes.length || signatureBytes[cursor] !== 0x02) return null;
+  const sLenInfo = readDerLen(signatureBytes, cursor + 1);
+  if (!sLenInfo) return null;
+  cursor = sLenInfo.next;
+  if (cursor + sLenInfo.length !== signatureBytes.length) return null;
+  const sRaw = signatureBytes.slice(cursor, cursor + sLenInfo.length);
+
+  const rNoPrefix = padTo32BytesHex(bytesToHexNoPrefix(rRaw));
+  const sNoPrefix = padTo32BytesHex(bytesToHexNoPrefix(sRaw));
+  if (!rNoPrefix || !sNoPrefix) return null;
+
+  return {
+    r: `0x${rNoPrefix}`,
+    s: `0x${sNoPrefix}`
+  };
+}
+
+function recoverWithRS(message: string, r: string, s: string): string | null {
+  const digest = hashMessage(message);
+  for (const v of [27, 28] as const) {
+    try {
+      return getAddress(recoverAddress(digest, { r, s, v }));
+    } catch {
+      // try next recovery id
+    }
+  }
+  return null;
+}
+
+function recoverAuthSigner(
+  message: string,
+  signatureInput: string
+): { signer: string | null; format: string; details?: string } {
+  const normalized = normalizeSignatureHex(signatureInput);
+
+  try {
+    return {
+      signer: getAddress(verifyMessage(message, normalized)),
+      format: "ethers_rsv_or_2098"
+    };
+  } catch {
+    // fall through to extra formats
+  }
+
+  let bytes: Uint8Array;
+  try {
+    bytes = getBytes(normalized);
+  } catch (error) {
+    return {
+      signer: null,
+      format: "unknown",
+      details: `invalid_hex_signature: ${(error as Error).message}`
+    };
+  }
+
+  if (bytes.length === 64) {
+    const r = `0x${bytesToHexNoPrefix(bytes.slice(0, 32))}`;
+    const s = `0x${bytesToHexNoPrefix(bytes.slice(32, 64))}`;
+    const signer = recoverWithRS(message, r, s);
+    return {
+      signer,
+      format: "raw_r_plus_s_64",
+      details: signer ? undefined : "cannot_recover_from_64_byte_r_plus_s"
+    };
+  }
+
+  const der = parseDerEcdsa(bytes);
+  if (der) {
+    const signer = recoverWithRS(message, der.r, der.s);
+    return {
+      signer,
+      format: "der_asn1",
+      details: signer ? undefined : "cannot_recover_from_der_signature"
+    };
+  }
+
+  return {
+    signer: null,
+    format: "unsupported",
+    details: `unsupported_signature_length_${bytes.length}`
+  };
+}
+
 function createAuthMessage(miner: string, nonce: string, issuedAtSec: number, expiresAtSec: number): string {
   const issuedAtIso = new Date(issuedAtSec * 1000).toISOString();
   const expiresAtIso = new Date(expiresAtSec * 1000).toISOString();
@@ -129,7 +272,7 @@ async function getGenesisTimestamp(): Promise<bigint> {
 
 async function getTokenAddress(): Promise<string> {
   if (cachedTokenAddress) return getAddress(cachedTokenAddress);
-  const value = (await mining.botcoinToken()) as string;
+  const value = (await mining.agcoinToken()) as string;
   cachedTokenAddress = value;
   return getAddress(value);
 }
@@ -369,23 +512,24 @@ app.post("/v1/auth/verify", async (req, res, next) => {
       return;
     }
 
-    let recovered: string;
-    try {
-      recovered = getAddress(verifyMessage(parsed.message, parsed.signature));
-    } catch (error) {
+    const recoveredResult = recoverAuthSigner(parsed.message, parsed.signature);
+    if (!recoveredResult.signer) {
       res.status(401).json({
         error: "invalid_signature",
         reason: "signature_parse_failed",
-        details: (error as Error).message
+        formatTried: recoveredResult.format,
+        details: recoveredResult.details
       });
       return;
     }
-    if (recovered !== miner) {
+
+    if (recoveredResult.signer !== miner) {
       res.status(401).json({
         error: "invalid_signature",
         reason: "recovered_mismatch",
+        formatUsed: recoveredResult.format,
         expectedMiner: miner,
-        recoveredSigner: recovered
+        recoveredSigner: recoveredResult.signer
       });
       return;
     }
