@@ -24,6 +24,8 @@ dotenv.config();
 const config = {
   port: Number(process.env.PORT ?? 3000),
   rpcUrl: process.env.RPC_URL ?? "",
+  rpcMaxRetries: Number(process.env.RPC_MAX_RETRIES ?? 4),
+  rpcRetryBaseMs: Number(process.env.RPC_RETRY_BASE_MS ?? 300),
   chainId: Number(process.env.CHAIN_ID ?? 8453),
   miningContractAddress: process.env.MINING_CONTRACT_ADDRESS ?? "",
   coordinatorSignerPrivateKey: process.env.COORDINATOR_SIGNER_PRIVATE_KEY ?? "",
@@ -93,10 +95,44 @@ type ChallengePayload = {
   createdAt: number;
 };
 
+type SubmitResponsePayload = {
+  pass: true;
+  receipt: {
+    miner: string;
+    epochId: number;
+    solveIndex: string;
+    prevReceiptHash: string;
+    challengeId: string;
+    commit: string;
+    docHash: string;
+    questionsHash: string;
+    constraintsHash: string;
+    answersHash: string;
+    worldSeed: string;
+    rulesVersion: number;
+  };
+  signature: string;
+  transaction: {
+    to: string;
+    chainId: number;
+    value: string;
+    data: string;
+  };
+  creditsPerSolve: number;
+};
+
+type SubmitResultRecord = {
+  miner: string;
+  nonce: string;
+  challengeId: string;
+  response: SubmitResponsePayload;
+};
+
 const authNonces = new Map<string, NonceRecord>();
 const authTokens = new Map<string, TokenRecord>();
 const challenges = new Map<string, ChallengePayload>();
 const creditsBook = new Map<string, number>();
+const submitResults = new Map<string, SubmitResultRecord>();
 const localLocks = new Map<string, { token: string; expiresAt: number }>();
 
 type RequestMetric = {
@@ -120,6 +156,67 @@ let cachedTokenAddress: string | null = config.agcoinTokenAddress ?? null;
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+class RpcReadError extends Error {
+  readonly operation: string;
+  readonly retryable: boolean;
+  readonly details: string;
+
+  constructor(operation: string, retryable: boolean, details: string) {
+    super(`[${operation}] ${details}`);
+    this.name = "RpcReadError";
+    this.operation = operation;
+    this.retryable = retryable;
+    this.details = details;
+  }
+}
+
+function isRetryableRpcError(error: unknown): boolean {
+  const msg = errorMessage(error).toLowerCase();
+  return (
+    msg.includes("timeout") ||
+    msg.includes("timed out") ||
+    msg.includes("429") ||
+    msg.includes("rate") ||
+    msg.includes("temporarily unavailable") ||
+    msg.includes("503") ||
+    msg.includes("connection") ||
+    msg.includes("network") ||
+    msg.includes("socket") ||
+    msg.includes("econn") ||
+    msg.includes("missing revert data")
+  );
+}
+
+async function withRpcRetry<T>(operation: string, fn: () => Promise<T>): Promise<T> {
+  let attempt = 0;
+  let lastError: unknown;
+  while (attempt <= config.rpcMaxRetries) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      const retryable = isRetryableRpcError(error);
+      if (!retryable || attempt === config.rpcMaxRetries) {
+        throw new RpcReadError(operation, retryable, errorMessage(error));
+      }
+      const base = config.rpcRetryBaseMs * 2 ** attempt;
+      const jitter = Math.floor(Math.random() * Math.max(25, base * 0.25));
+      await sleep(base + jitter);
+      attempt += 1;
+    }
+  }
+  throw new RpcReadError(operation, false, errorMessage(lastError));
 }
 
 function randomHex(bytesCount: number): string {
@@ -299,6 +396,10 @@ function keyChallenge(challengeId: string): string {
   return `challenge:${challengeId}`;
 }
 
+function keySubmitResult(challengeId: string): string {
+  return `submit:result:${challengeId}`;
+}
+
 function keyMinerCredits(miner: string): string {
   return `credits:${miner.toLowerCase()}`;
 }
@@ -445,6 +546,22 @@ async function deleteChallengeRecord(challengeId: string): Promise<void> {
   await redis.del(keyChallenge(challengeId));
 }
 
+async function setSubmitResult(record: SubmitResultRecord): Promise<void> {
+  submitResults.set(record.challengeId, record);
+  if (!redis) return;
+  await redis.set(keySubmitResult(record.challengeId), JSON.stringify(record), { EX: 60 * 60 });
+}
+
+async function getSubmitResult(challengeId: string): Promise<SubmitResultRecord | null> {
+  const local = submitResults.get(challengeId);
+  if (local) return local;
+  if (!redis) return null;
+  const parsed = parseJsonRecord<SubmitResultRecord>(await redis.get(keySubmitResult(challengeId)));
+  if (!parsed) return null;
+  submitResults.set(challengeId, parsed);
+  return parsed;
+}
+
 async function addCredits(miner: string, epochId: number, delta: number): Promise<void> {
   const creditKey = `${epochId}:${miner}`;
   creditsBook.set(creditKey, (creditsBook.get(creditKey) ?? 0) + delta);
@@ -516,14 +633,14 @@ async function releaseMinerLock(kind: "challenge" | "submit", miner: string, tok
 
 async function getGenesisTimestamp(): Promise<bigint> {
   if (cachedGenesisTimestamp !== null) return cachedGenesisTimestamp;
-  const value = (await mining.genesisTimestamp()) as bigint;
+  const value = (await withRpcRetry("genesisTimestamp", async () => mining.genesisTimestamp() as Promise<bigint>)) as bigint;
   cachedGenesisTimestamp = value;
   return value;
 }
 
 async function getTokenAddress(): Promise<string> {
   if (cachedTokenAddress) return getAddress(cachedTokenAddress);
-  const value = (await mining.agcoinToken()) as string;
+  const value = (await withRpcRetry("agcoinToken", async () => mining.agcoinToken() as Promise<string>)) as string;
   cachedTokenAddress = value;
   return getAddress(value);
 }
@@ -646,10 +763,10 @@ async function creditsForMiner(miner: string): Promise<number> {
   const tokenAddress = await getTokenAddress();
   const token = new Contract(tokenAddress, erc20Abi, provider);
   const [balance, tier1, tier2, tier3] = (await Promise.all([
-    token.balanceOf(miner),
-    mining.tier1Balance(),
-    mining.tier2Balance(),
-    mining.tier3Balance()
+    withRpcRetry("balanceOf", async () => token.balanceOf(miner) as Promise<bigint>),
+    withRpcRetry("tier1Balance", async () => mining.tier1Balance() as Promise<bigint>),
+    withRpcRetry("tier2Balance", async () => mining.tier2Balance() as Promise<bigint>),
+    withRpcRetry("tier3Balance", async () => mining.tier3Balance() as Promise<bigint>)
   ])) as [bigint, bigint, bigint, bigint];
 
   if (balance >= tier3) return 3;
@@ -894,7 +1011,10 @@ app.get("/v1/challenge", authMiddleware, async (req, res, next) => {
     try {
       const { epochId } = await getEpochInfo();
 
-      const epochCommit = (await mining.epochCommit(BigInt(epochId))) as string;
+      const epochCommit = (await withRpcRetry(
+        "epochCommit",
+        async () => mining.epochCommit(BigInt(epochId)) as Promise<string>
+      )) as string;
       if (epochCommit === "0x0000000000000000000000000000000000000000000000000000000000000000") {
         await logEvent({
           eventType: "challenge_denied",
@@ -964,6 +1084,12 @@ app.post("/v1/submit", authMiddleware, async (req, res, next) => {
       return;
     }
 
+    const existingResult = await getSubmitResult(parsed.challengeId);
+    if (existingResult && existingResult.miner.toLowerCase() === miner.toLowerCase()) {
+      res.json(existingResult.response);
+      return;
+    }
+
     const lockToken = randomHex(12);
     const acquired = await acquireMinerLock("submit", miner, lockToken);
     if (!acquired) {
@@ -974,6 +1100,11 @@ app.post("/v1/submit", authMiddleware, async (req, res, next) => {
     try {
       const challenge = await getChallengeRecord(parsed.challengeId);
       if (!challenge || challenge.miner !== miner || challenge.nonce !== parsed.nonce) {
+        const replay = await getSubmitResult(parsed.challengeId);
+        if (replay && replay.miner.toLowerCase() === miner.toLowerCase()) {
+          res.json(replay.response);
+          return;
+        }
         await logEvent({
           eventType: "submit_failed",
           miner,
@@ -1003,8 +1134,8 @@ app.post("/v1/submit", authMiddleware, async (req, res, next) => {
 
       const [epochData, solveIndex, prevReceiptHash] = await Promise.all([
         getEpochInfo(),
-        mining.nextIndex(miner) as Promise<bigint>,
-        mining.lastReceiptHash(miner) as Promise<string>
+        withRpcRetry("nextIndex", async () => mining.nextIndex(miner) as Promise<bigint>),
+        withRpcRetry("lastReceiptHash", async () => mining.lastReceiptHash(miner) as Promise<string>)
       ]);
 
       if (epochData.epochId !== challenge.epochId) {
@@ -1100,7 +1231,7 @@ app.post("/v1/submit", authMiddleware, async (req, res, next) => {
         details: { creditsPerSolve: challenge.creditsPerSolve }
       });
 
-      res.json({
+      const responsePayload: SubmitResponsePayload = {
         pass: true,
         receipt: {
           miner,
@@ -1124,7 +1255,16 @@ app.post("/v1/submit", authMiddleware, async (req, res, next) => {
           data: txData
         },
         creditsPerSolve: challenge.creditsPerSolve
+      };
+
+      await setSubmitResult({
+        miner,
+        nonce: parsed.nonce,
+        challengeId: challenge.challengeId,
+        response: responsePayload
       });
+
+      res.json(responsePayload);
     } finally {
       await releaseMinerLock("submit", miner, lockToken);
     }
@@ -1243,6 +1383,29 @@ app.get("/v1/admin/metrics", async (req, res, next) => {
 });
 
 app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+  if (err instanceof RpcReadError) {
+    const status = err.retryable ? 503 : 502;
+    void logEvent({
+      eventType: "rpc_error",
+      success: false,
+      statusCode: status,
+      errorCode: err.operation,
+      details: {
+        path: req.path,
+        method: req.method,
+        message: err.details,
+        retryable: err.retryable
+      }
+    });
+    res.status(status).json({
+      error: "rpc_error",
+      operation: err.operation,
+      message: err.details,
+      retryable: err.retryable
+    });
+    return;
+  }
+
   if (err instanceof z.ZodError) {
     res.status(400).json({ error: "invalid_request", details: err.flatten() });
     return;
